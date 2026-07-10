@@ -1,0 +1,6 @@
+# Build output
+bin/
+obj/
+
+# Google OAuth client credentials and cached tokens - never commit these
+client_secret.json

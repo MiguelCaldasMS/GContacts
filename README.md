@@ -1,8 +1,10 @@
 # GContacts
 
-A small .NET 10 console app that lists the contacts in your Google account using the
-[Google People API](https://developers.google.com/people) and prints the **name**, **email**,
-**added date**, and **modified date** of the first 100.
+A small .NET 10 console app that finds the contacts in your Google account that have
+**neither a phone number nor an email**, prints **all available metadata** (name, addresses,
+organizations, and every other field the People API returns) for each, and then **permanently
+deletes** them (after a confirmation prompt) using the
+[Google People API](https://developers.google.com/people).
 
 ## One-time setup
 
@@ -25,10 +27,14 @@ cached under `%AppData%\GContacts\token`, so you won't be prompted again on late
 
 ## Notes
 
-- The scope requested is `contacts` (full read/write) so the app can also create, update, and delete
-  contacts. Those write operations aren't implemented yet — only reading is wired up so far.
+- **Deletion is permanent.** The app prints each matching contact and asks you to type `yes` before
+  deleting; there is no undo. Review the output before confirming.
+- If Google returns a **quota/rate-limit** error, the app waits 5 minutes and retries that one
+  contact once; a second quota error in a row (or any other error) stops the run.
+- The scope requested is `contacts` (full read/write). The app uses it to **delete** the matching
+  contacts; create and update operations aren't implemented.
 - If you already authorized once with a narrower scope, delete the cached token folder
   `%AppData%\GContacts\token` so the consent screen reappears and includes the write permission.
-- The Google People API does **not** expose a contact creation/"added" timestamp, so that column
-  shows `N/A`. Only the last-modified time (`updateTime`) is available.
+- The Google People API does **not** expose a contact creation/"added" timestamp, so no "added"
+  date is shown. Only the last-modified time (`updateTime`) is available.
 - `client_secret.json` and the cached token contain secrets and are excluded via `.gitignore`.

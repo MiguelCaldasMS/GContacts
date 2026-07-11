@@ -1,4 +1,4 @@
-﻿// GContacts - lists Google Contacts (name, email, added date, modified date) via the Google People API.
+﻿// GContacts - finds Google Contacts that have neither a phone number nor an email, prints all available metadata for each, then permanently deletes them via the Google People API.
 //
 // One-time setup (see README.md for details):
 //   1. In Google Cloud Console, create a project and enable the "People API".
@@ -17,11 +17,16 @@ namespace GContacts;
 
 internal static class Program
 {
-    // Full read/write access so the app can also create, update, and delete contacts (write operations not yet implemented).
+    // Full read/write access so the app can delete contacts (create/update not implemented).
     private static readonly string[] Scopes = { PeopleServiceService.Scope.Contacts };
     private const string ApplicationName = "GContacts";
     private const string CredentialsFile = "client_secret.json";
-    private const int DisplayLimit = 100;
+
+    // Every field the People API can return for a connection, so the app can print all available metadata for each person.
+    private const string AllPersonFields = "addresses,ageRanges,biographies,birthdays,calendarUrls,clientData,coverPhotos,emailAddresses,events,externalIds,genders,imClients,interests,locales,locations,memberships,metadata,miscKeywords,names,nicknames,occupations,organizations,phoneNumbers,photos,relations,sipAddresses,skills,urls,userDefined";
+
+    // On a quota/rate-limit error the app waits this long, then retries the same contact once.
+    private static readonly TimeSpan QuotaRetryDelay = TimeSpan.FromMinutes(5);
 
     private static async Task<int> Main()
     {
@@ -41,7 +46,7 @@ internal static class Program
             Console.WriteLine($"Retrieved {contacts.Count} contact(s) from your Google account.");
             Console.WriteLine();
 
-            DisplayContacts(contacts);
+            await DisplayAndDeleteContactsAsync(service, contacts);
             return 0;
         }
         catch (Exception ex)
@@ -67,7 +72,7 @@ internal static class Program
         do
         {
             PeopleResource.ConnectionsResource.ListRequest request = service.People.Connections.List("people/me");
-            request.PersonFields = "names,emailAddresses,metadata";
+            request.PersonFields = AllPersonFields;
             request.PageSize = 1000;
             request.SortOrder = PeopleResource.ConnectionsResource.ListRequest.SortOrderEnum.FIRSTNAMEASCENDING;
             request.PageToken = pageToken;
@@ -81,26 +86,200 @@ internal static class Program
         return people;
     }
 
-    private static void DisplayContacts(IReadOnlyList<Person> contacts)
+    private static async Task DisplayAndDeleteContactsAsync(PeopleServiceService service, IReadOnlyList<Person> contacts)
     {
-        int count = Math.Min(contacts.Count, DisplayLimit);
-        PrintRow("#", "Name", "Email", "Added", "Modified");
-        Console.WriteLine(new string('-', 92));
-
-        for (int i = 0; i < count; i++)
+        List<Person> toDelete = contacts.Where(person => !HasPhoneNumber(person) && !HasEmail(person)).ToList();
+        if (toDelete.Count == 0)
         {
-            Person person = contacts[i];
-            string name = person.Names?.FirstOrDefault()?.DisplayName ?? "(no name)";
-            string email = person.EmailAddresses?.FirstOrDefault()?.Value ?? "(no email)";
-            // The People API does not expose a contact creation timestamp, so "Added" is unavailable.
-            string added = "N/A";
-            DateTimeOffset? modified = GetModifiedTime(person);
-            string modifiedText = modified.HasValue ? modified.Value.LocalDateTime.ToString("yyyy-MM-dd HH:mm") : "N/A";
-            PrintRow((i + 1).ToString(), Truncate(name, 26), Truncate(email, 32), added, modifiedText);
+            Console.WriteLine("No contacts without both a phone number and an email were found.");
+            return;
         }
 
-        if (contacts.Count > DisplayLimit) { Console.WriteLine($"\n(Showing the first {DisplayLimit} of {contacts.Count} contacts.)"); }
-        Console.WriteLine("\nNote: 'Added' date is not provided by the Google People API; only the last-modified time is available.");
+        Console.WriteLine($"{toDelete.Count} of {contacts.Count} contact(s) have no phone number and no email.");
+        Console.WriteLine("Each will be displayed and then PERMANENTLY deleted. This cannot be undone.");
+        Console.Write("Type 'yes' to continue: ");
+        string? answer = Console.ReadLine();
+        if (!string.Equals(answer?.Trim(), "yes", StringComparison.OrdinalIgnoreCase))
+        {
+            Console.WriteLine("Aborted. No contacts were deleted.");
+            return;
+        }
+
+        Console.WriteLine();
+        int index = 1;
+        int deleted = 0;
+        foreach (Person person in toDelete)
+        {
+            DisplayPerson(index, person);
+            if (await DeleteContactAsync(service, person)) { deleted++; }
+            Console.WriteLine();
+            index++;
+        }
+
+        Console.WriteLine($"Deleted {deleted} of {toDelete.Count} contact(s).");
+    }
+
+    private static async Task<bool> DeleteContactAsync(PeopleServiceService service, Person person)
+    {
+        string? resourceName = person.ResourceName;
+        if (string.IsNullOrWhiteSpace(resourceName))
+        {
+            Console.Error.WriteLine("    Skipped deletion: contact has no resource name.");
+            return false;
+        }
+
+        try
+        {
+            await service.People.DeleteContact(resourceName).ExecuteAsync();
+            Console.WriteLine("    Deleted.");
+            return true;
+        }
+        catch (Exception ex) when (IsQuotaExceeded(ex))
+        {
+            // Quota exceeded: wait, then retry this same contact once.
+            Console.Error.WriteLine($"    Quota exceeded for '{resourceName}'. Waiting {QuotaRetryDelay.TotalMinutes:0} minutes before one retry...");
+            await Task.Delay(QuotaRetryDelay);
+
+            try
+            {
+                await service.People.DeleteContact(resourceName).ExecuteAsync();
+                Console.WriteLine("    Deleted (after retry).");
+                return true;
+            }
+            catch (Exception retryEx) when (IsQuotaExceeded(retryEx))
+            {
+                // A second consecutive quota error for the same contact terminates the run.
+                throw new InvalidOperationException($"Quota exceeded again for '{resourceName}' after waiting {QuotaRetryDelay.TotalMinutes:0} minutes. Terminating.", retryEx);
+            }
+        }
+    }
+
+    private static bool IsQuotaExceeded(Exception ex)
+    {
+        if (ex is not Google.GoogleApiException apiEx) { return false; }
+        if (apiEx.HttpStatusCode == System.Net.HttpStatusCode.TooManyRequests) { return true; }
+
+        Google.Apis.Requests.RequestError? error = apiEx.Error;
+        if (error?.Errors == null) { return false; }
+        foreach (Google.Apis.Requests.SingleError single in error.Errors)
+        {
+            string reason = single.Reason ?? string.Empty;
+            if (reason.Contains("quota", StringComparison.OrdinalIgnoreCase) || reason.Contains("rateLimit", StringComparison.OrdinalIgnoreCase)) { return true; }
+        }
+
+        return false;
+    }
+
+    private static bool HasPhoneNumber(Person person)
+    {
+        return person.PhoneNumbers != null && person.PhoneNumbers.Any(phone => !string.IsNullOrWhiteSpace(phone.Value));
+    }
+
+    private static bool HasEmail(Person person)
+    {
+        return person.EmailAddresses != null && person.EmailAddresses.Any(email => !string.IsNullOrWhiteSpace(email.Value));
+    }
+
+    private static void DisplayPerson(int index, Person person)
+    {
+        string name = person.Names?.FirstOrDefault()?.DisplayName ?? "(no name)";
+        Console.WriteLine($"[{index}] {name}");
+
+        PrintField("Resource name", person.ResourceName);
+        PrintValues("Names", person.Names?.Select(FormatName));
+        PrintValues("Nicknames", person.Nicknames?.Select(n => n.Value));
+        PrintValues("Email addresses", person.EmailAddresses?.Select(e => WithType(e.Value, e.FormattedType ?? e.Type)));
+        PrintValues("Phone numbers", person.PhoneNumbers?.Select(p => WithType(p.Value, p.FormattedType ?? p.Type)));
+        PrintValues("Addresses", person.Addresses?.Select(a => WithType(a.FormattedValue, a.FormattedType ?? a.Type)));
+        PrintValues("Organizations", person.Organizations?.Select(FormatOrganization));
+        PrintValues("Occupations", person.Occupations?.Select(o => o.Value));
+        PrintValues("Birthdays", person.Birthdays?.Select(FormatBirthday));
+        PrintValues("Events", person.Events?.Select(ev => WithType(FormatDate(ev.Date), ev.FormattedType ?? ev.Type)));
+        PrintValues("Genders", person.Genders?.Select(g => g.FormattedValue ?? g.Value));
+        PrintValues("Biographies", person.Biographies?.Select(b => b.Value));
+        PrintValues("URLs", person.Urls?.Select(u => WithType(u.Value, u.FormattedType ?? u.Type)));
+        PrintValues("IM clients", person.ImClients?.Select(c => WithType(c.Username, c.FormattedProtocol ?? c.Protocol)));
+        PrintValues("SIP addresses", person.SipAddresses?.Select(s => WithType(s.Value, s.FormattedType ?? s.Type)));
+        PrintValues("Relations", person.Relations?.Select(r => WithType(r.Person, r.FormattedType ?? r.Type)));
+        PrintValues("Interests", person.Interests?.Select(x => x.Value));
+        PrintValues("Skills", person.Skills?.Select(x => x.Value));
+        PrintValues("Locales", person.Locales?.Select(x => x.Value));
+        PrintValues("Locations", person.Locations?.Select(x => x.Value));
+        PrintValues("Misc keywords", person.MiscKeywords?.Select(k => WithType(k.Value, k.FormattedType ?? k.Type)));
+        PrintValues("External IDs", person.ExternalIds?.Select(x => WithType(x.Value, x.FormattedType ?? x.Type)));
+        PrintValues("Calendar URLs", person.CalendarUrls?.Select(c => WithType(c.Url, c.FormattedType ?? c.Type)));
+        PrintValues("Age ranges", person.AgeRanges?.Select(a => a.AgeRange));
+        PrintValues("Memberships", person.Memberships?.Select(FormatMembership));
+        PrintValues("User-defined", person.UserDefined?.Select(u => $"{u.Key}: {u.Value}"));
+        PrintValues("Client data", person.ClientData?.Select(c => $"{c.Key}: {c.Value}"));
+        PrintValues("Photos", person.Photos?.Select(p => p.Url));
+        PrintValues("Cover photos", person.CoverPhotos?.Select(p => p.Url));
+        PrintValues("Sources", person.Metadata?.Sources?.Select(FormatSource));
+
+        DateTimeOffset? modified = GetModifiedTime(person);
+        if (modified.HasValue) { PrintField("Last modified", modified.Value.LocalDateTime.ToString("yyyy-MM-dd HH:mm")); }
+    }
+
+    private static string? FormatName(Name name)
+    {
+        List<string> parts = new List<string>();
+        AddPart(parts, "display", name.DisplayName);
+        AddPart(parts, "prefix", name.HonorificPrefix);
+        AddPart(parts, "given", name.GivenName);
+        AddPart(parts, "middle", name.MiddleName);
+        AddPart(parts, "family", name.FamilyName);
+        AddPart(parts, "suffix", name.HonorificSuffix);
+        AddPart(parts, "phonetic", name.PhoneticFullName);
+        return parts.Count > 0 ? string.Join(", ", parts) : null;
+    }
+
+    private static void AddPart(List<string> parts, string label, string? value)
+    {
+        if (!string.IsNullOrWhiteSpace(value)) { parts.Add($"{label}={value}"); }
+    }
+
+    private static string? FormatOrganization(Organization org)
+    {
+        List<string> parts = new List<string>();
+        if (!string.IsNullOrWhiteSpace(org.Title)) { parts.Add(org.Title); }
+        if (!string.IsNullOrWhiteSpace(org.Name)) { parts.Add($"at {org.Name}"); }
+        if (!string.IsNullOrWhiteSpace(org.Department)) { parts.Add($"({org.Department})"); }
+        return WithType(string.Join(" ", parts), org.FormattedType ?? org.Type);
+    }
+
+    private static string? FormatBirthday(Birthday birthday)
+    {
+        string? date = FormatDate(birthday.Date);
+        return !string.IsNullOrWhiteSpace(date) ? date : birthday.Text;
+    }
+
+    private static string? FormatDate(Date? date)
+    {
+        if (date == null) { return null; }
+        if (date.Year.HasValue) { return $"{date.Year.Value:D4}-{date.Month ?? 0:D2}-{date.Day ?? 0:D2}"; }
+        if (date.Month.HasValue || date.Day.HasValue) { return $"{date.Month ?? 0:D2}-{date.Day ?? 0:D2}"; }
+        return null;
+    }
+
+    private static string? FormatMembership(Membership membership)
+    {
+        if (membership.ContactGroupMembership != null) { return $"group: {membership.ContactGroupMembership.ContactGroupResourceName ?? membership.ContactGroupMembership.ContactGroupId}"; }
+        if (membership.DomainMembership != null) { return $"domain (in viewer domain: {membership.DomainMembership.InViewerDomain})"; }
+        return null;
+    }
+
+    private static string? FormatSource(Source source)
+    {
+        DateTimeOffset? updated = source.UpdateTimeDateTimeOffset;
+        string when = updated.HasValue ? updated.Value.LocalDateTime.ToString("yyyy-MM-dd HH:mm") : "n/a";
+        return $"{source.Type ?? "unknown"} (updated {when})";
+    }
+
+    private static string? WithType(string? value, string? type)
+    {
+        if (string.IsNullOrWhiteSpace(value)) { return null; }
+        if (string.IsNullOrWhiteSpace(type)) { return value; }
+        return $"{value} ({type})";
     }
 
     private static DateTimeOffset? GetModifiedTime(Person person)
@@ -119,14 +298,25 @@ internal static class Program
         return latest;
     }
 
-    private static void PrintRow(string index, string name, string email, string added, string modified)
+    private static void PrintValues(string label, IEnumerable<string?>? values)
     {
-        Console.WriteLine($"{index,-4} {name,-26} {email,-32} {added,-10} {modified,-16}");
+        if (values == null) { return; }
+        List<string> list = values.Where(v => !string.IsNullOrWhiteSpace(v)).Select(v => v!).ToList();
+        if (list.Count == 0) { return; }
+        if (list.Count == 1)
+        {
+            Console.WriteLine($"    {label}: {list[0]}");
+        }
+        else
+        {
+            Console.WriteLine($"    {label}:");
+            foreach (string value in list) { Console.WriteLine($"      - {value}"); }
+        }
     }
 
-    private static string Truncate(string value, int maxLength)
+    private static void PrintField(string label, string? value)
     {
-        if (value.Length <= maxLength) { return value; }
-        return value.Substring(0, maxLength - 1) + "\u2026";
+        if (string.IsNullOrWhiteSpace(value)) { return; }
+        Console.WriteLine($"    {label}: {value}");
     }
 }
